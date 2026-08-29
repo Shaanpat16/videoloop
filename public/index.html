@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Kiosk Loop</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    cursor: none;
+    -webkit-user-select: none; user-select: none;
+  }
+  #stage { position: fixed; inset: 0; background: #000; }
+  video {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;              /* overridden to contain via ?fit=contain */
+    background: #000;
+    opacity: 0;
+    transition: opacity var(--fade, 400ms) ease;
+    will-change: opacity;
+  }
+  video.active { opacity: 1; }
+  body.fit-contain video { object-fit: contain; }
+
+  #message {
+    position: fixed; inset: 0;
+    display: none;
+    flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; text-align: center; padding: 8vw;
+    color: #8a8a8a; background: #000;
+  }
+  #message.show { display: flex; }
+  #message h1 { font-size: clamp(20px, 4vw, 34px); font-weight: 600; color: #ddd; letter-spacing: -0.01em; }
+  #message p { font-size: clamp(13px, 2.2vw, 18px); line-height: 1.5; max-width: 30ch; }
+  #message code { background: #1a1a1a; padding: 2px 7px; border-radius: 5px; color: #b9b9b9; }
+
+  #debug {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: none;
+    padding: 10px 14px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #cfcfcf; background: rgba(0,0,0,.72);
+    backdrop-filter: blur(6px);
+    white-space: pre-wrap; word-break: break-all;
+  }
+  body.debug #debug { display: block; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="a" muted playsinline preload="auto"></video>
+  <video id="b" muted playsinline preload="auto"></video>
+</div>
+
+<div id="message">
+  <h1>No videos yet</h1>
+  <p>Add video files to the <code>videos/</code> folder in the repo and push. This screen picks them up automatically.</p>
+</div>
+
+<div id="debug"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var params      = new URLSearchParams(location.search);
+  var FIT         = params.get("fit") || "cover";          // cover | contain
+  var SHUFFLE     = params.get("shuffle") === "1";
+  var POLL_MS     = Math.max(15, num(params.get("poll"), 60)) * 1000;
+  var FADE_MS     = Math.max(0, num(params.get("fade"), 400));
+  var DEBUG       = params.has("debug");
+  var RELOAD_MIN  = num(params.get("reloadHours"), 12) * 60 * 60 * 1000; // safety reload
+
+  if (FIT === "contain") document.body.classList.add("fit-contain");
+  if (DEBUG) document.body.classList.add("debug");
+  document.documentElement.style.setProperty("--fade", FADE_MS + "ms");
+
+  var els     = [document.getElementById("a"), document.getElementById("b")];
+  var msg     = document.getElementById("message");
+  var dbg     = document.getElementById("debug");
+
+  var playlist = [];      // [{src, name}]
+  var manifestKey = null; // changes when the videos/ folder changes
+  var index   = 0;        // index of the currently playing item
+  var cur     = 0;        // which <video> element is on screen
+  var started = false;
+  var advancing = false;
+  var failStreak = 0;
+  var bootTime = Date.now();
+
+  function num(v, d) { var n = parseFloat(v); return isFinite(n) ? n : d; }
+
+  function log() {
+    if (!DEBUG) return;
+    var line = Array.prototype.join.call(arguments, " ");
+    dbg.textContent = (new Date().toLocaleTimeString() + "  " + line + "\n" + dbg.textContent).split("\n").slice(0, 12).join("\n");
+  }
+
+  function showMessage(on) { msg.classList.toggle("show", !!on); }
+
+  // ---- manifest ----------------------------------------------------------
+
+  function fetchManifest() {
+    return fetch("videos.json?t=" + Date.now(), { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("videos.json " + r.status);
+        return r.json();
+      });
+  }
+
+  function applyManifest(data, isFirst) {
+    var items = (data && data.videos) || [];
+    var key = items.map(function (v) { return v.src + ":" + (v.size || 0); }).join("|");
+
+    if (key === manifestKey) return false;      // nothing changed
+    manifestKey = key;
+
+    playlist = items.slice();
+    if (SHUFFLE) {
+      for (var i = playlist.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var t = playlist[i]; playlist[i] = playlist[j]; playlist[j] = t;
+      }
+    }
+    log("playlist updated:", playlist.length, "video(s)");
+    showMessage(playlist.length === 0);
+
+    if (playlist.length === 0) {
+      els.forEach(function (v) { v.pause(); v.removeAttribute("src"); v.load(); v.classList.remove("active"); });
+      started = false;
+      return true;
+    }
+
+    if (!started || isFirst) { index = 0; start(); }
+    return true;
+  }
+
+  function poll() {
+    fetchManifest()
+      .then(function (d) { applyManifest(d, false); })
+      .catch(function (e) { log("poll failed:", e.message); })
+      .then(function () {
+        // Long-running safety net: a periodic hard reload clears any leaked
+        // memory on a screen that has been up for days.
+        if (RELOAD_MIN > 0 && Date.now() - bootTime > RELOAD_MIN) location.reload();
+      });
+  }
+
+  // ---- playback ----------------------------------------------------------
+
+  function itemAt(i) { return playlist[((i % playlist.length) + playlist.length) % playlist.length]; }
+
+  function start() {
+    started = true;
+    var v = els[cur];
+    loadInto(v, itemAt(index));
+    play(v);
+    v.classList.add("active");
+    els[1 - cur].classList.remove("active");
+    preloadNext();
+  }
+
+  function loadInto(v, item) {
+    if (!item) return;
+    v.src = item.src;
+    v.load();
+    log("load", item.name);
+  }
+
+  function play(v) {
+    var p = v.play();
+    if (p && p.catch) {
+      p.catch(function (err) {
+        // Autoplay is muted, so this should not happen — but if it does,
+        // retry once on the next tick rather than freezing the screen.
+        log("play blocked:", err.name);
+        // A codec the browser can't decode will never start — move on at once.
+        if (err.name === "NotSupportedError") { advance(); return; }
+        setTimeout(function () { v.play().catch(function () { advance(); }); }, 500);
+      });
+    }
+  }
+
+  function preloadNext() {
+    if (playlist.length < 2) return;
+    var nxt = els[1 - cur];
+    var item = itemAt(index + 1);
+    if (nxt.dataset.src !== item.src) {
+      nxt.dataset.src = item.src;
+      loadInto(nxt, item);
+    }
+  }
+
+  function advance() {
+    if (advancing || playlist.length === 0) return;
+    advancing = true;
+    setTimeout(function () { advancing = false; }, 250);
+
+    if (playlist.length === 1) {
+      // Single video: just loop it in place, no crossfade needed.
+      var only = els[cur];
+      only.currentTime = 0;
+      play(only);
+      return;
+    }
+
+    index += 1;
+    var next = els[1 - cur];
+    var prev = els[cur];
+    var item = itemAt(index);
+
+    if (next.dataset.src !== item.src) loadInto(next, item);
+    next.currentTime = 0;
+    play(next);
+    next.classList.add("active");
+    prev.classList.remove("active");
+    cur = 1 - cur;
+
+    setTimeout(function () {
+      prev.pause();
+      preloadNext();
+    }, FADE_MS + 100);
+  }
+
+  els.forEach(function (v) {
+    v.addEventListener("ended", function () {
+      if (v.classList.contains("active")) { failStreak = 0; advance(); }
+    });
+    v.addEventListener("error", function () {
+      if (!v.classList.contains("active")) return;
+      log("error on", v.currentSrc || v.src);
+      failStreak++;
+      // Every file failing means something is wrong with the deploy —
+      // back off and re-check the manifest instead of spinning.
+      if (failStreak > Math.max(3, playlist.length)) {
+        failStreak = 0;
+        setTimeout(function () { manifestKey = null; poll(); }, 5000);
+      } else {
+        advance();
+      }
+    });
+  });
+
+  // A stalled decoder on cheap kiosk hardware can hang forever; nudge it.
+  setInterval(function () {
+    var v = els[cur];
+    if (!started || !v || playlist.length === 0) return;
+    if (v.readyState >= 2 && v.paused) play(v);
+  }, 5000);
+
+  // ---- boot --------------------------------------------------------------
+
+  fetchManifest()
+    .then(function (d) { applyManifest(d, true); })
+    .catch(function (e) {
+      log("initial load failed:", e.message);
+      showMessage(true);
+    });
+
+  setInterval(poll, POLL_MS);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) { var v = els[cur]; if (v && v.paused && started) play(v); }
+  });
+})();
+</script>
+</body>
+</html>

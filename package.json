@@ -1,0 +1,11 @@
+{
+  "name": "kiosk-loop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Drop videos in a folder, push, and they loop fullscreen on a Render URL.",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "start": "npm run build && npx --yes serve dist -l 3000",
+    "dev": "npm run start"
+  }
+}

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: kiosk-loop
+    runtime: static
+    buildCommand: node scripts/build.js
+    staticPublishPath: ./dist
+    pullRequestPreviewsEnabled: false
+    headers:
+      # The player polls this file to notice newly pushed videos.
+      - path: /videos.json
+        name: Cache-Control
+        value: no-store, max-age=0
+      - path: /index.html
+        name: Cache-Control
+        value: no-store, max-age=0
+      # Video files are immutable once deployed; let the kiosk cache them hard.
+      - path: /videos/*
+        name: Cache-Control
+        value: public, max-age=604800
